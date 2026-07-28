@@ -1,7 +1,7 @@
 # Probes three public endpoints of the dashboard every 5 minutes; opens a GitHub issue on failure, closes it on recovery.
-# Lives in a PUBLIC repo because public repositories get UNMETERED Actions minutes ‚Äî a 5-minute cadence cannot run on a metered budget.
+# Lives in a PUBLIC repo because public repositories get UNMETERED Actions minutes — a 5-minute cadence cannot run on a metered budget.
 # Pasted through the GitHub web UI because the owner's PAT carries repo scope but not workflow scope, so workflow files cannot be pushed.
-# Expected cost: zero ‚Äî public-repo minutes are free, no secrets, no third-party monitoring account.
+# Expected cost: zero — public-repo minutes are free, no secrets, no third-party monitoring account.
 
 name: uptime
 
@@ -125,7 +125,7 @@ jobs:
             SUMMARY="probe step did not complete"
           fi
 
-          TITLE="üî¥ dashboard probe failing: ${SUMMARY} [${SIG}]"
+          TITLE="🔴 dashboard probe failing: ${SUMMARY} [${SIG}]"
 
           # Dedupe: one open issue per failing-condition signature, so a long outage at a
           # 5-minute cadence produces one notification rather than twelve an hour.
