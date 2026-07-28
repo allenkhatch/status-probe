@@ -1,0 +1,183 @@
+# Probes three public endpoints of the dashboard every 5 minutes; opens a GitHub issue on failure, closes it on recovery.
+# Lives in a PUBLIC repo because public repositories get UNMETERED Actions minutes ‚Äî a 5-minute cadence cannot run on a metered budget.
+# Pasted through the GitHub web UI because the owner's PAT carries repo scope but not workflow scope, so workflow files cannot be pushed.
+# Expected cost: zero ‚Äî public-repo minutes are free, no secrets, no third-party monitoring account.
+
+name: uptime
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub queues scheduled runs and drops them under load, so treat
+    # this as "usually 5 min, worst case ~15 min" detection latency, not a hard guarantee.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    # A full run is ~10s healthy / ~2min worst case (3 checks x 15s timeout + 2 retries x 10s).
+    timeout-minutes: 3
+    steps:
+      # No checkout: nothing in the repo is needed. gh and curl are preinstalled on the runner.
+      - name: Probe endpoints
+        id: probe
+        run: |
+          set -euo pipefail
+
+          BASE="https://dashboard.ggrdata.com"
+
+          # The host sits behind a CDN that bot-filters unrecognised User-Agents with a 403
+          # on every path. A default curl UA from a datacenter IP is exactly the profile that
+          # gets filtered, which would fake an outage every 5 minutes. Send a browser UA so the
+          # probe measures the site, not the bot filter.
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+          # Echoes the HTTP status code, or 000 when the connection failed or timed out.
+          probe() {
+            local code=""
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -A "$UA" "$1" 2>/dev/null) || true
+            if [ -z "$code" ]; then code="000"; fi
+            printf '%s' "$code"
+          }
+
+          # Expected-status rules, one per check.
+          #   healthz  200 = process alive.
+          #   shell    307 = the documented redirect from / to the static shell; 200 if ever served direct.
+          #   apigate  401 = the auth gate is answering and refusing unauthenticated callers.
+          #                  200 means it answered WITHOUT credentials, which is its own condition.
+          # 403 anywhere = the edge layer intercepted (bot filter / origin lock): degraded, not down.
+          verdict() {
+            case "$1" in
+              healthz) case "$2" in 200) echo OK ;; 403) echo DEGRADED ;; *) echo DOWN ;; esac ;;
+              shell)   case "$2" in 200|307) echo OK ;; 403) echo DEGRADED ;; *) echo DOWN ;; esac ;;
+              apigate) case "$2" in 401) echo OK ;; 200) echo UNEXPECTED_OPEN ;; 403) echo DEGRADED ;; *) echo DOWN ;; esac ;;
+            esac
+          }
+
+          FAILED=""
+
+          run_check() {
+            local id="$1" path="$2" code verd stamp attempts
+            stamp=$(date -u +%H:%M:%SZ)
+            code=$(probe "${BASE}${path}")
+            verd=$(verdict "$id" "$code")
+            attempts="${code} at ${stamp}"
+            # One retry after 10s so a single transient blip is not reported as an outage.
+            if [ "$verd" != "OK" ]; then
+              sleep 10
+              stamp=$(date -u +%H:%M:%SZ)
+              code=$(probe "${BASE}${path}")
+              verd=$(verdict "$id" "$code")
+              attempts="${attempts}, retry ${code} at ${stamp}"
+            fi
+            echo "${id} ${path} ${verd} (${attempts})"
+            printf -- '- `%s` (`%s`): **%s** - %s\n' "$id" "$path" "$verd" "$attempts" >> detail.md
+            if [ "$verd" != "OK" ]; then FAILED="${FAILED}${id}=${verd} "; fi
+          }
+
+          printf 'Probe run at %s (UTC).\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > detail.md
+
+          run_check healthz "/healthz"
+          run_check shell   "/"
+          run_check apigate "/api/health"
+
+          if [ -z "$FAILED" ]; then
+            echo "status=ok" >> "$GITHUB_OUTPUT"
+            echo "all checks passed"
+          else
+            SUMMARY="${FAILED% }"
+            # Signature covers the failing check/verdict SET only - not codes or timestamps - so a
+            # flap between two 5xx codes stays one issue, and a genuinely different failure opens a new one.
+            SIG=$(printf '%s' "$SUMMARY" | sha1sum | cut -c1-8)
+            {
+              echo "status=fail"
+              echo "sig=${SIG}"
+              echo "summary=${SUMMARY}"
+            } >> "$GITHUB_OUTPUT"
+            echo "failing: ${SUMMARY} [${SIG}]"
+          fi
+
+      - name: File issue on failure
+        # !cancelled() overrides the implicit success() gate: if the probe step itself
+        # dies, status is empty and this must STILL fire (the 00000000 fallback below).
+        # A bare `steps...!= 'ok'` condition would be skipped after a step failure.
+        if: ${{ !cancelled() && steps.probe.outputs.status != 'ok' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          SIG: ${{ steps.probe.outputs.sig }}
+          SUMMARY: ${{ steps.probe.outputs.summary }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Fallback identity for the case where the probe step crashed before writing outputs.
+          if [ -z "${SIG:-}" ]; then
+            SIG="00000000"
+            SUMMARY="probe step did not complete"
+          fi
+
+          TITLE="üî¥ dashboard probe failing: ${SUMMARY} [${SIG}]"
+
+          # Dedupe: one open issue per failing-condition signature, so a long outage at a
+          # 5-minute cadence produces one notification rather than twelve an hour.
+          OPEN=$(gh issue list --state open --limit 100 --json title \
+                 --jq "[.[] | select(.title | contains(\"[${SIG}]\"))] | length")
+          if [ "${OPEN:-0}" -gt 0 ]; then
+            echo "open issue for ${SIG} already exists - not duplicating"
+            exit 0
+          fi
+
+          {
+            echo "Automated probe of https://dashboard.ggrdata.com failed."
+            echo
+            cat detail.md 2>/dev/null || echo "(no detail recorded - the probe step did not complete)"
+            echo
+            echo "Run log: ${RUN_URL}"
+            echo
+            echo "Status key: OK = expected status. DOWN = unexpected status, 5xx, timeout or no connection."
+            echo "DEGRADED = 403 from the edge layer rather than the app. UNEXPECTED_OPEN = a gated endpoint returned an unexpected success status."
+            echo
+            echo "Closes automatically on the next fully passing run. Add the \`keep-open\` label to keep it open through planned maintenance."
+            echo "Signature \`${SIG}\` dedupes repeat alerts for the same failing set."
+          } > body.md
+
+          gh label create site-down --color B60205 --description "Auto: dashboard probe failure" --force >/dev/null 2>&1 || true
+          gh issue create --title "$TITLE" --body-file body.md --label site-down --assignee "$OWNER"
+          echo "filed issue for ${SIG}"
+
+      - name: Close issues on recovery
+        if: steps.probe.outputs.status == 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # A fully passing run is sufficient evidence of recovery, so close every open probe
+          # issue - not just the matching signature - except any the owner marked keep-open.
+          # The 8-hex title guard means only auto-filed issues are ever touched.
+          NUMS=$(gh issue list --state open --label site-down --limit 100 --json number,title,labels \
+                 --jq '[ .[]
+                         | select((.labels | map(.name) | index("keep-open")) | not)
+                         | select(.title | test("\\[[0-9a-f]{8}\\]"))
+                         | .number ] | .[]' 2>/dev/null || true)
+
+          if [ -z "${NUMS:-}" ]; then
+            echo "all checks passed; no open probe issues to close"
+            exit 0
+          fi
+
+          for n in $NUMS; do
+            gh issue comment "$n" --body "probe recovered at ${RUN_URL}"
+            gh issue close "$n"
+            echo "closed #${n}"
+          done
